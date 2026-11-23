@@ -1,38 +1,190 @@
-Projeto: MBA Arquitetura Full Cycle - Observabilidade e DevOps/SRE
-Fase do projeto: Do sintoma ao post-mortem
-
 # Do sintoma ao post-mortem
 
-Uma instrumentação inacabada, uma queixa do financeiro, e um documento no fim que explica o que aconteceu
+Entrega do MBA Arquitetura Full Cycle — Observabilidade e DevOps/SRE. API TypeScript/Express e worker processam pedidos via Redis e PostgreSQL, com Prometheus, Grafana, Jaeger e Alertmanager locais. O defeito de negócio foi preservado: o objetivo é torná-lo observável, não corrigi-lo.
+
+## Como rodar
+
+**Pré-requisitos:** Git, PowerShell 7+ e Docker com suporte a containers Linux e Docker Compose v2 atualizado. No Windows, inicie o Docker Desktop. Não é necessário instalar Node.js, npm ou PostgreSQL no host. Execute os comandos abaixo no PowerShell, mantendo a mesma sessão e o diretório do projeto; as portas publicadas no `compose.yaml` precisam estar livres.
+
+```powershell
+git clone https://github.com/thxago/mba-arch-desafio-observabilidade.git
+Set-Location .\mba-arch-desafio-observabilidade
+Copy-Item .env.example .env
+docker compose up -d --wait --wait-timeout 180
+docker compose ps -a
+Invoke-RestMethod -Uri 'http://127.0.0.1:8080/health' -TimeoutSec 10
+Invoke-RestMethod -Uri 'http://127.0.0.1:8081/health' -TimeoutSec 10
+```
+
+O Compose constrói a imagem na primeira execução, aguarda banco/Redis e executa o seed antes da API e do worker. Ambos devem ficar `healthy` e responder `status: ok`; o seed deve terminar com código 0, não permanecer rodando. O arquivo `.env` é local e ignorado pelo Git: não versione credenciais. Estes exemplos usam as portas padrão `API_PORT=8080` e `WORKER_PORT=8081`, também usadas pelos healthchecks e pela coleta configurada.
+
+| Acesso | Endereço / verificação |
+| --- | --- |
+| API e métricas | `http://127.0.0.1:8080/produtos` e `http://127.0.0.1:8080/metrics` |
+| Worker | `http://127.0.0.1:8081/health` e `http://127.0.0.1:8081/metrics` |
+| Dashboard Pedidos | `http://127.0.0.1:3000/d/pedidos/pedidos`; login definido por `GRAFANA_ADMIN_USER` e `GRAFANA_ADMIN_PASSWORD` no `.env` |
+| Prometheus | `http://127.0.0.1:9090/targets`: API e worker `UP`; `http://127.0.0.1:9090/rules`: `FalhaEmCobrancas` sem erro |
+| Jaeger | `http://127.0.0.1:16686`; serviços `api` e `worker` após gerar tráfego |
+| Alertmanager | `http://127.0.0.1:9093` |
+| Receptor do webhook | `http://127.0.0.1:9099`; a prova do recebimento está em `docker compose logs receptor-alertas` |
+
+O dashboard e os dois datasources são provisionados por arquivos, sem configuração pela interface. Aguarde as primeiras coletas de 15s para consultar métricas.
+
+**Criar e consultar um pedido real.** O seed já inclui produtos e pedidos antigos; não suponha IDs fixos. Este exemplo usa um produto retornado pela API e um cliente de pagamento aprovado:
+
+```powershell
+$produtos = Invoke-RestMethod -Uri 'http://127.0.0.1:8080/produtos' -TimeoutSec 10
+$produto = $produtos[0]
+$corpo = @{
+    cliente_id = 'cli-0001'
+    itens = @(@{ produto_id = $produto.id; quantidade = 1 })
+} | ConvertTo-Json -Depth 4
+$inicioPedido = [DateTimeOffset]::UtcNow.ToString('o')
+$criado = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8080/pedidos' `
+    -ContentType 'application/json' -Body $corpo -TimeoutSec 10
+$criado
+for ($tentativa = 0; $tentativa -lt 20; $tentativa++) {
+    $pedido = Invoke-RestMethod -Uri "http://127.0.0.1:8080/pedidos/$($criado.pedido_id)" -TimeoutSec 10
+    if ($pedido.status -ne 'pendente') { break }
+    Start-Sleep -Milliseconds 500
+}
+$pedido | ConvertTo-Json -Depth 5
+```
+
+O POST responde 202 com `pedido_id` e `status: pendente`; o processamento é assíncrono. Se o pedido continuar pendente após a espera, consulte saúde e logs do worker.
+
+**Correlacionar API, fila e worker.** Obtenha o trace do pedido recém-criado, sem copiar um ID de outra execução:
+
+```powershell
+$eventos = docker compose logs --since $inicioPedido --no-color --no-log-prefix api worker |
+    Where-Object { $_.StartsWith('{') } |
+    ForEach-Object { $_ | ConvertFrom-Json }
+$traceId = ($eventos | Where-Object {
+    $_.pedido_id -eq $criado.pedido_id -and $_.service -eq 'api'
+} | Select-Object -First 1).trace_id
+if (-not $traceId) { throw 'Trace do pedido não encontrado nos logs.' }
+docker compose logs --since $inicioPedido --no-color api worker |
+    Select-String -SimpleMatch $traceId
+"http://127.0.0.1:16686/trace/$traceId"
+```
+
+Após alguns segundos para exportação, abra a URL impressa: o mesmo trace deve conter `pedido.criar` na API e `pedido.processar` no worker. Para inspecionar as últimas linhas JSON sem o prefixo do Compose:
+
+```powershell
+docker compose logs --no-color --no-log-prefix --tail 20 api worker
+```
+
+**Validar a regra antes da carga.** Com a stack ativa, execute os testes de regra já versionados. O caminho `/test` é interno ao container Linux; o caminho de montagem no host é PowerShell/Windows.
+
+```powershell
+docker compose exec -T prometheus promtool check rules /etc/prometheus/regras/falha-em-cobrancas.yml
+docker compose run --rm --no-deps --entrypoint promtool --volume "${PWD}\prometheus:/test:ro" prometheus test rules /test/testes/falha-em-cobrancas.test.yml
+```
+
+Os casos cobrem tráfego saudável com recusas legítimas, tráfego zero, séries ausentes, igualdade ao budget e falha sustentada respeitando `for`. Depois de editar regras, recarregue com `Invoke-WebRequest -Method Post -Uri 'http://127.0.0.1:9090/-/reload' -TimeoutSec 10` e confira `/rules`.
+
+**Cargas e teste ponta a ponta, sem sobreposição.** Não mantenha outro gerador ativo. Se repetir um teste após um incidente, aguarde `FalhaEmCobrancas` voltar a `inactive` em `/rules` e a notificação `resolved` chegar ao receptor antes de começar. Reiniciar o receptor não apaga logs antigos nem resolve alertas no Alertmanager.
+
+Primeiro rode `normal` por pelo menos três minutos, após reiniciar o receptor. O bloco mantém o ID do container criado e para somente esse gerador, inclusive se a observação for interrompida:
+
+```powershell
+docker compose restart receptor-alertas
+$inicioNormal = [DateTimeOffset]::UtcNow.ToString('o')
+$normal = docker compose run --rm -d --no-deps carga normal
+if ($LASTEXITCODE -ne 0) { throw 'Não foi possível iniciar normal.' }
+try {
+    Start-Sleep -Seconds 180
+    docker compose logs --since $inicioNormal --no-color receptor-alertas
+} finally {
+    docker stop $normal | Out-Null
+}
+```
+
+O esperado é **nenhuma notificação de `FalhaEmCobrancas`** nesse intervalo. Não prossiga se houver uma; confira geradores anteriores, estado da regra e logs. O cenário saudável inclui aprovações e recusas legítimas, sem a falha técnica investigada.
+
+Somente depois de parar `normal`, execute `cenario-a`. O bloco observa o primeiro webhook por até cinco minutos, mede o intervalo desde o início real do container e encerra apenas sua própria carga:
+
+```powershell
+$desdeIncidente = [DateTimeOffset]::UtcNow.ToString('o')
+$incidente = docker compose run --rm -d --no-deps carga cenario-a
+if ($LASTEXITCODE -ne 0) { throw 'Não foi possível iniciar cenario-a.' }
+try {
+    $inicioIncidente = [DateTimeOffset]::Parse((docker inspect --format '{{.State.StartedAt}}' $incidente))
+    $limite = $inicioIncidente.AddMinutes(5)
+    do {
+        Start-Sleep -Seconds 5
+        $webhook = docker compose logs --since $desdeIncidente --no-color --no-log-prefix receptor-alertas |
+            Select-String -SimpleMatch 'alerta=FalhaEmCobrancas status=firing' |
+            Select-Object -First 1
+    } while (-not $webhook -and [DateTimeOffset]::UtcNow -lt $limite)
+    if (-not $webhook) { throw 'Webhook não recebido em até cinco minutos.' }
+    $recebido = [DateTimeOffset]::Parse(($webhook.Line -split ' ')[0])
+    $segundos = ($recebido - $inicioIncidente).TotalSeconds
+    $webhook.Line
+    'Detecção: {0:N3} segundos' -f $segundos
+    if ($segundos -gt 300) { throw 'Webhook recebido fora do limite de cinco minutos.' }
+} finally {
+    docker stop $incidente | Out-Null
+}
+docker compose logs --since $desdeIncidente --no-color api worker |
+    Select-String -SimpleMatch '"level":"error"'
+```
+
+O esperado é o webhook `status=firing` e logs de erro de cobrança com motivo, `pedido_id` e `trace_id`, mesmo com respostas HTTP de sucesso. As variáveis dos geradores guardam seus IDs reais; se precisar pará-los manualmente, use `docker stop $normal` ou `docker stop $incidente`, somente enquanto o respectivo container existir. Não execute os dois blocos em paralelo.
+
+**Alterações e encerramento.** O código é montado em volume, mas não recarrega sozinho: após editar arquivos em `src\` ou trocar seu conteúdo por operações Git, reinicie os processos. Alterações em dependências exigem rebuild. Para executar os testes da aplicação, o `sh` abaixo roda dentro do container Linux, não no host:
+
+```powershell
+docker compose restart api worker
+docker compose up -d --build
+docker compose exec -T api sh -c 'npm run tipos && node --import tsx --test src/*/*.test.ts'
+```
+
+Esses comandos atendem situações distintas; não é necessário rebuild para editar apenas `src\`. Ao terminar, pare primeiro qualquer gerador criado com `compose run` e então use `docker compose down`, que mantém os volumes nomeados. **Não use `down -v` para uma parada normal:** essa opção remove pedidos, histórico do Prometheus e estado persistido de Grafana/Alertmanager. Jaeger e Redis usam memória e perdem traces/fila ao recriar seus containers.
+
+A investigação histórica, com fontes, IDs, precisão das contagens e ações propostas, está em `reports\post-mortem.md`. Seus horários e IDs pertencem à reprodução de 23/11/2026, não são resultados esperados de um clone novo.
+
+## Equivalências com o curso
+
+| Aspecto | Java no curso | TypeScript nesta entrega |
+| --- | --- | --- |
+| Métricas | Spring Boot Actuator expõe métricas do Micrometer para o Prometheus | `prom-client`: `Registry`, `Counter` e `Histogram`, expostos em `/metrics`; coleta pull pelo Prometheus |
+| Tracing | Micrometer Tracing com bridge OpenTelemetry e exportação OTLP | `@opentelemetry/sdk-node`, `@opentelemetry/auto-instrumentations-node` e `@opentelemetry/api` para spans manuais; `@opentelemetry/exporter-trace-otlp-http` para Jaeger |
+| Logs estruturados | Logs JSON com IDs do contexto de tracing correlacionados via MDC | Logger próprio usa `trace.getActiveSpan()` e escreve JSON no stdout com `trace_id`, `span_id` e `pedido_id`; sem MDC ou biblioteca de logging adicional |
+| Propagação de contexto | W3C Trace Context associado ao tracing OpenTelemetry na aplicação Java | `propagation.inject()` no JSON da fila Redis; `propagation.extract(ROOT_CONTEXT, mensagem)` e `context.with()` no consumidor, preservando `traceparent`/`tracestate` quando presentes |
+
+Actuator, Micrometer e o bridge são componentes Java, não dependências instaladas no Node. A equivalência está nos sinais, no contexto e nos protocolos.
 
 ## Decisões técnicas
 
-O logger compartilhado consulta o span ativo pela API do OpenTelemetry em cada escrita e inclui `trace_id` e `span_id` em todas as linhas JSON. Sem span ativo, ambos são strings vazias. Logs de pedidos incluem `pedido_id` como campo estruturado, preservando a mensagem original; o contexto do processamento também fornece esse campo aos logs das camadas internas do worker.
+O histograma usava caminhos concretos como `/pedidos/25`, criando séries por identificador e multiplicando memória/armazenamento até comprometer o Prometheus em produção; agora usa templates como `/pedidos/:id` e o valor fixo `nao_encontrada` para rotas desconhecidas.
 
-Os spans manuais `pedido.criar` e `pedido.processar` delimitam o negócio e incluem atributos de pedido, cliente e valor; o processamento também registra o status final e a fila. A publicação injeta o W3C Trace Context no JSON da mensagem pela API de propagação do OpenTelemetry. O worker extrai esse contexto a partir de `ROOT_CONTEXT` e o ativa antes de criar seu span consumidor, mantendo API e worker no mesmo trace sem herdar o contexto de outra mensagem. Mensagens antigas sem contexto continuam sendo processadas, iniciando um trace independente.
-
-Exceções capturadas são registradas no span ativo, com status de erro, e em log `error` com o motivo. Os spans terminam em `finally`, inclusive em retornos antecipados. O fluxo funcional permanece intacto: falhas de cobrança não foram corrigidas, e o handler async do Express 4 relança as exceções em vez de convertê-las em respostas 500.
-
-O histograma usava caminhos concretos como `/pedidos/25`, criando novas séries para cada identificador e multiplicando o consumo de memória do Prometheus em produção; agora usa templates como `/pedidos/:id` e o valor fixo `nao_encontrada` para rotas desconhecidas.
-
-| Métrica | O que responde |
+| Métrica de negócio | O que responde / ponto de incremento |
 | --- | --- |
-| `pedidos_criados_total` | Quantos pedidos foram persistidos com sucesso, antes da publicação na fila? |
-| `pedidos_confirmados_total` | Quantos pedidos o worker efetivamente atualizou para confirmado, independentemente do resultado da cobrança? |
-| `cobrancas_processadas_total` | Quantas cobranças foram aprovadas, legitimamente recusadas ou terminaram em exceção? O label `resultado` distingue `aprovada`, `recusada` e `falha`. |
+| `pedidos_criados_total` | Quantos pedidos foram persistidos com sucesso? Incrementada pela API após criar no banco, antes de publicar na fila; não garante publicação nem processamento |
+| `pedidos_confirmados_total` | Quantos pedidos o worker atualizou para confirmado? Incrementada após persistir o status; não garante pagamento aprovado |
+| `cobrancas_processadas_total` | Quantas cobranças tiveram aprovação, recusa legítima ou exceção? O único label de negócio é `resultado`, com os valores `aprovada`, `recusada` e `falha` |
 
-Os três contadores são inicializados em zero nos dois processos, incluindo os três resultados de cobrança. Somente a API incrementa pedidos criados; somente o worker incrementa confirmações e resultados de cobrança. Para consultar o total da aplicação, some as séries dos processos. Nenhuma métrica usa IDs de pedido ou cliente como labels; esses identificadores continuam nos logs e traces. Contagens não representam valores monetários, e uma confirmação não é tratada como prova de cobrança aprovada.
+Os três contadores são inicializados em zero nos dois processos, incluindo todos os resultados de cobrança. Somente a API incrementa criações; somente o worker incrementa confirmações e resultados de cobrança. Some as séries dos processos; aplique `rate()`/`increase()` antes da soma para tratar resets individualmente. IDs de pedido/cliente ficam nos logs e traces, nunca nos labels.
 
-O dashboard **Pedidos**, em `http://localhost:3000/d/pedidos/pedidos`, é provisionado por `grafana/provisioning/dashboards/pedidos.json`, com quatro painéis em duas linhas:
+Essas métricas contam eventos, não valores financeiros nem pedidos únicos em possíveis reprocessamentos. `increase()` extrapola amostras e não substitui uma contagem exata; o valor monetário exige cruzar os pedidos afetados com seus dados no banco, sem somar indiscriminadamente todas as confirmações.
+
+O dashboard **Pedidos**, versionado em `grafana\provisioning\dashboards\pedidos.json`, contém quatro painéis:
 
 | Painel | Pergunta respondida | Como interpretar |
 | --- | --- | --- |
-| Falhas tecnicas: cobrancas e HTTP 5xx | O sistema está com erro? | Compara falhas técnicas de cobrança e respostas HTTP 5xx por segundo; recusas legítimas não são falhas. |
-| Latencia HTTP p95 por rota | O sistema está lento? | Mostra em segundos o p95 por template de rota, agregando os buckets por `le` e `route` antes de calcular o quantil, sem `/health` e `/metrics`. |
-| Pedidos criados, confirmados e cobrancas aprovadas | O dinheiro está entrando? | Compara as taxas de criação, confirmação e cobrança aprovada; confirmações sustentadamente acima de aprovações revelam divergência, mesmo com HTTP 2xx. |
-| Cobrancas por resultado | O dinheiro está entrando? | Separa aprovações, recusas legítimas e falhas técnicas para explicar o destino das cobranças. |
+| Falhas tecnicas: cobrancas e HTTP 5xx | O sistema está com erro? | Compara falhas técnicas de cobrança e HTTP 5xx/s; recusas legítimas não são falhas e HTTP 2xx não prova cobrança |
+| Latencia HTTP p95 por rota | O sistema está lento? | p95 em segundos, agregando buckets por `le` e `route` antes do quantil; exclui `/health` e `/metrics` |
+| Pedidos criados, confirmados e cobrancas aprovadas | O dinheiro está entrando? | Compara as três taxas; confirmações sustentadamente acima de aprovações sinalizam divergência |
+| Cobrancas por resultado | O dinheiro está entrando? | Separa aprovações, recusas legítimas e falhas técnicas para explicar o destino das cobranças |
 
-As consultas usam `$__rate_interval`, respeitando a frequência de coleta do Prometheus e o zoom do painel, e aplicam `rate()` antes da agregação para tratar resets de cada processo. Unidades são eventos por segundo ou segundos, nunca moeda: o dashboard não quantifica receita nem prejuízo. Atrasos da fila podem causar diferenças transitórias entre confirmação e aprovação; uma divergência sustentada é sinal para investigar pelos traces e logs. Sem requisições na janela, o p95 fica sem valor; a linha HTTP 5xx só assume zero na presença das métricas HTTP, sem mascarar a ausência da coleta. Alterações do dashboard devem ser salvas no JSON versionado, não depender de ajustes manuais na interface.
+As consultas usam `$__rate_interval`, respeitando coleta e zoom, e `rate()` antes da agregação. Unidades são eventos/s ou segundos, nunca moeda: os painéis não quantificam receita nem prejuízo. Atrasos da fila podem produzir diferenças transitórias. Sem requisições, o p95 fica sem valor; HTTP 5xx só assume zero na presença das métricas HTTP, sem mascarar coleta ausente. Salve mudanças no JSON versionado, não apenas na interface.
+
+O logger consulta o span ativo em cada escrita e sempre inclui `timestamp`, `level`, `service`, `msg`, `trace_id` e `span_id`; sem span, os dois IDs são strings vazias. Logs de pedidos incluem `pedido_id`, fornecido explicitamente ou pelo contexto ativo do processamento. Não há agregador central de logs.
+
+Os spans `pedido.criar` e `pedido.processar` delimitam o negócio com atributos de pedido, cliente e valor; o consumidor inclui fila e status final. O produtor injeta W3C Trace Context no JSON sem alterar os dados originais. O worker extrai a partir de `ROOT_CONTEXT` e ativa o contexto antes do span `CONSUMER`, evitando herdar contexto de outra mensagem. Mensagens antigas sem contexto continuam válidas e iniciam um trace independente.
+
+O SDK sobe antes da aplicação, instrumenta automaticamente HTTP, Redis e PostgreSQL, amostra 100% e exporta diretamente por OTLP/HTTP para o Jaeger, sem Collector. Exceções capturadas geram evento no span, status `ERROR` e log com motivo; spans terminam em `finally`. O fluxo original foi preservado, inclusive a confirmação incorreta após falha de cobrança e o relançamento no handler async do Express 4, sem converter uma rejeição que derrubaria a API em resposta 500.
 
 ## SLO e alerta
 
@@ -48,11 +200,11 @@ and on()
 (sum(increase(cobrancas_processadas_total[30d])) > 0)
 ```
 
-**SLO:** SLI de pelo menos **99,9% em uma janela móvel de 30 dias**. É um objetivo proposto para este serviço: a cobrança é financeiramente crítica, então toleramos no máximo uma falha técnica a cada mil cobranças, sem penalizar recusas legítimas. Esse SLI mede processamento técnico, não conciliação financeira nem valor recebido.
+**SLO:** SLI de pelo menos **99,9% em janela móvel de 30 dias**. A cobrança é financeiramente crítica: o objetivo proposto tolera no máximo uma falha técnica a cada mil cobranças, sem penalizar recusas legítimas. Mede processamento técnico, não conciliação financeira ou valor recebido.
 
-**Error budget:** `1 - 0,999 = 0,001 = 0,1%` das cobranças da janela. Para `N` cobranças processadas, o orçamento é `0,001 × N` falhas técnicas; por exemplo, 10 falhas em 10.000 cobranças. Como o SLO é baseado em eventos, esse orçamento não equivale automaticamente a minutos de indisponibilidade. O Compose configura retenção de 30 dias no Prometheus para comportar a janela do objetivo. `increase()` estima incrementos a partir das amostras; antes de haver 30 dias de histórico, o cálculo usa somente o período disponível.
+**Error budget:** `1 - 0,999 = 0,001 = 0,1%` das cobranças. Para `N` cobranças na janela, são `0,001 × N` falhas técnicas; por exemplo, 10 em 10.000. O orçamento é baseado em eventos, não automaticamente em minutos de indisponibilidade. O Compose mantém retenção de 30 dias no Prometheus; antes de haver esse histórico, o SLI usa apenas o período disponível e estimado por `increase()`.
 
-**Derivação do alerta:** a regra `FalhaEmCobrancas`, em `prometheus/regras/falha-em-cobrancas.yml`, compara a fração de falhas técnicas em uma janela curta de **1 minuto** com o mesmo budget, sem multiplicador de burn rate (`B = 1`):
+**Derivação de `FalhaEmCobrancas`:** a regra em `prometheus\regras\falha-em-cobrancas.yml` compara a fração de falhas em **1 minuto** com o mesmo budget, sem multiplicador adicional de burn rate (`B = 1`):
 
 ```text
 limiar = B × (1 - SLO) = 1 × (1 - 0,999) = 0,001 = 0,1%
@@ -68,345 +220,10 @@ and on()
 (sum(rate(cobrancas_processadas_total[1m])) > 0)
 ```
 
-A condição deve permanecer verdadeira por `for: 1m`. O limite é estrito: taxa igual ao budget não dispara. A janela curta prioriza detectar rapidamente o defeito financeiro do exercício; não é uma afirmação de que o SLO mensal já foi violado, nem substitui uma política de múltiplas janelas para produção. Essa escolha é sensível a falhas isoladas em baixo volume e deve ser revista antes de uso operacional.
+A condição deve permanecer verdadeira por **`for: 1m`**. O limite é estrito: igualdade ao budget não dispara. Recusas entram no denominador, não no numerador de falhas. Sem tráfego ou sem coleta, não há resultado avaliável que dispare; isso não comprova sucesso e ausência de telemetria exigiria monitoramento próprio.
 
-Recusas entram no denominador, não no numerador de falhas. Sem cobranças na janela, as expressões ficam sem resultado avaliável e não disparam; ausência de coleta também não é convertida em sucesso e exigiria monitoramento próprio. Primeiro se calcula `rate()` por série e depois se soma, preservando o tratamento de resets por processo.
+O Prometheus coleta e avalia a cada **15s**. A detecção inclui histórico saudável na janela de `rate()`, coleta, avaliação, `for` e **`group_wait: 10s`** do Alertmanager; atualizações do grupo respeitam `group_interval: 30s` e repetições, `repeat_interval: 1h`. Reiniciar API/worker não limpa o histórico do Prometheus. O único destino é o webhook local `receptor-alertas`, com severidade `critical`.
 
-O Prometheus coleta e avalia a cada 15s. A detecção inclui a diluição do tráfego anterior na janela de `rate()`, coleta, avaliação, `for: 1m` e o `group_wait: 10s` do Alertmanager. Reiniciar API e worker não apaga o histórico do Prometheus. O destino permanece exclusivamente o webhook local `receptor-alertas`, com severidade `critical`.
+A janela curta busca tornar o defeito observável durante o exercício, não provar que o SLO de 30 dias já foi violado. É sensível a falhas isoladas em baixo volume e deve ser revista antes de uso operacional, inclusive quanto a alertas de múltiplas janelas.
 
-Para validar e carregar a regra, com a stack ativa:
-
-```powershell
-docker compose up -d --no-deps --wait prometheus
-docker compose exec -T prometheus promtool check rules /etc/prometheus/regras/falha-em-cobrancas.yml
-docker compose run --rm --no-deps --entrypoint promtool --volume "${PWD}\prometheus:/test:ro" prometheus test rules /test/testes/falha-em-cobrancas.test.yml
-Invoke-WebRequest -Method Post http://localhost:9090/-/reload
-```
-
-Confirme `FalhaEmCobrancas` em `http://localhost:9090/rules`. Reinicie `receptor-alertas`, registre o horário e rode `normal` por pelo menos três minutos, sem notificações. Pare esse gerador antes de iniciar `cenario-a`; o webhook deve chegar em até cinco minutos. Ao consultar os logs, filtre pelo horário do teste: reiniciar o container não apaga suas linhas antigas.
-
-Na reprodução de 23/11/2026, `normal` foi observado por **180,329 segundos sem notificações**. Em seguida, o primeiro webhook de `FalhaEmCobrancas` chegou **86,915 segundos** após iniciar `cenario-a`: início às 19:18:05,639 e recebimento às 19:19:32,554 (UTC-03:00). Esse é o tempo medido de ponta a ponta, não apenas o `for`; novas execuções variam conforme coleta, avaliação, histórico e agrupamento.
-
-## Descrição
-
-Você vai receber uma aplicação em TypeScript com dois processos e uma instrumentação pela metade. Alguém do time começou a instrumentar meses atrás e parou justamente antes das partes que dão sentido ao resto.
-
-Seu trabalho tem três movimentos. **Terminar** o que foi começado: ligar o log ao trace, fazer o contexto atravessar a fila, consertar um erro de cardinalidade que já está plantado nas métricas, criar as métricas de negócio que faltam e montar o dashboard. **Definir** o que é qualidade de serviço aqui, transformando isso num SLO e derivando dele o alerta. E **usar** tudo isso para investigar a queixa que chegou do financeiro e fechar o incidente com um post-mortem.
-
-Este desafio cobre dois módulos do MBA: Observabilidade e DevOps e SRE.
-
-## Cenário
-
-Você entrou no time de plataforma de uma loja online. O sistema roda em produção, o Jaeger mostra spans, o log sai em JSON, o Prometheus está coletando. Parece que tem tudo.
-
-Aí o financeiro fechou o mês e faltou dinheiro. Alguém abriu o Grafana, não achou nada, e a resposta que circula pelo Slack é que deve ser problema do banco. Você foi contratado para acabar com o palpite.
-
-## Sobre o foco do desafio
-
-O foco é observabilidade e resposta a incidente, não desenvolvimento de produto e não performance. A aplicação vem pronta e funcional, e o seu trabalho é completar a instrumentação dela e configurar o que falta na stack.
-
-Você não deve corrigir o defeito da aplicação. Ele é o objeto de estudo: é o que a sua instrumentação precisa revelar. Corrigir faz o cenário de carga parar de reproduzir a queixa, e o alerta que deveria disparar não dispara mais.
-
-## Sobre pesquisar fora do que foi ensinado
-
-O curso ensinou observabilidade em Java, com Actuator, Micrometer e o bridge do OpenTelemetry. Este desafio é em TypeScript, e isso é deliberado: observabilidade é especificação, não framework. Span continua sendo span, propagação continua sendo W3C Trace Context, e cardinalidade alta continua derrubando Prometheus em qualquer stack. O que muda é o nome do pacote e a sintaxe, e descobrir esses equivalentes na documentação é parte do trabalho, tanto que o README tem uma tabela de equivalências como entregável. Você não precisa saber TypeScript de antemão: a aplicação vem funcionando e você completa código que já existe.
-
-Do lado de SRE, o post-mortem que você vai escrever no fim segue o template do módulo de DevOps e SRE, disponível em https://github.com/devfullcycle/MBA-fundamentos-devops-sre. Vale abrir antes de começar, porque saber quais perguntas o documento faz muda o que você presta atenção durante a investigação.
-
-## Repositório base
-
-https://github.com/devfullcycle/mba-arch-desafio-observabilidade
-
-Faça o fork e trabalhe nele. A entrega final fica na branch `main` do seu fork.
-
-Pré-requisitos: Docker, Docker Compose v2 e `curl`. Nada além disso precisa estar instalado na sua máquina.
-
-```
-cp .env.example .env
-docker compose up -d
-curl -s localhost:8080/health
-```
-
-Isso sobe a `api`, o `worker`, o Postgres, o Redis e a stack de observabilidade inteira, já parcialmente configurada.
-
-A pasta `src/` é montada como volume nos dois processos, então o container roda o código que está no seu disco e você não precisa reconstruir a imagem para testar uma mudança de código. Em compensação, o processo não recarrega sozinho: depois de editar qualquer arquivo em `src/`, rode `docker compose restart api worker`. Vale o mesmo para `git checkout`, `git stash` e `git pull`, que mudam o código do disco sem mexer no que já está rodando. A exceção é o `package.json`: as dependências ficam dentro da imagem, então acrescentar uma biblioteca exige `docker compose up -d --build`.
-
-## Contexto
-
-### A aplicação
-
-Um único projeto TypeScript, dois processos com o mesmo código-fonte e entrypoints diferentes, um Postgres e um Redis.
-
-`api` na porta 8080, com quatro rotas de negócio:
-
-- `GET /produtos` lista produtos e `GET /produtos/:id` devolve um produto, ou 404
-- `POST /pedidos` recebe `{cliente_id, itens: [{produto_id, quantidade}]}`, grava o pedido como `pendente`, publica na fila `pedidos` do Redis e devolve 202 com `{pedido_id, status}`
-- `GET /pedidos/:id` devolve o pedido, ou 404
-
-Além delas, `GET /health` e `GET /metrics`.
-
-`worker` na porta 8081, que expõe apenas `/health` e `/metrics`. Consome a fila `pedidos`, chama o processador de pagamento simulado e atualiza o pedido para `confirmado` ou `recusado`. O processador é uma função local, sem chamada externa, e o resultado depende do cliente: ele pode aprovar, recusar ou falhar.
-
-O Postgres sobe com produtos e com alguns pedidos antigos já carregados. Use `GET /produtos` para obter identificadores válidos.
-
-### O que já está instrumentado
-
-Este é o ponto de partida. Confira cada item com os próprios olhos antes de começar, porque o desafio inteiro parte daqui.
-
-- **Tracing automático funcionando.** O SDK do OpenTelemetry já sobe nos dois processos, com auto instrumentação de HTTP e de banco, exportando por OTLP para o Jaeger com amostragem em 100%. Uma requisição já vira trace com spans de rota e de consulta
-- **Log em JSON.** Os dois processos já escrevem uma linha JSON por evento no stdout, com os campos `timestamp`, `level`, `service` e `msg`. Não existe nenhum campo que ligue a linha a um trace
-- **Rota `/metrics` com `prom-client`.** Já existem as métricas padrão do processo e um histograma de latência HTTP chamado `http_request_duration_seconds`. Não existe nenhuma métrica de negócio
-- **Prometheus coletando.** Os dois processos já aparecem como `UP` em `http://localhost:9090/targets`, e o `prometheus.yml` já declara de onde ler as regras de alerta. A pasta de regras é que está vazia
-- **Grafana com datasources e um dashboard começado.** Prometheus e Jaeger já provisionados por arquivo, e existe um dashboard provisionado com um painel só, para você não precisar descobrir o formato do JSON do zero
-- **Alertmanager ligado ao receptor.** A rota e o receiver já apontam para o `receptor-alertas`, com o agrupamento já ajustado para o disparo ser rápido. Não existe nenhuma regra de alerta
-
-### O que não está
-
-Nada liga o log ao trace, e não existe nenhum span de negócio. O contexto não atravessa a fila, então o que a `api` faz e o que o `worker` faz aparecem hoje como dois traces separados, sem relação entre si. Não existe métrica de negócio, nem SLO declarado, nem regra de alerta, e o dashboard tem um painel só.
-
-Além disso, tem um problema plantado na instrumentação de métricas que já existe, que o requisito 3 trata.
-
-## A queixa
-
-**"Fechamos o mês e faltou dinheiro."** O financeiro cruzou os pedidos que aparecem como confirmados para o cliente com o que efetivamente entrou, e encontrou pedidos confirmados que nunca foram cobrados. Reproduz com `cenario-a`.
-
-Pista: do lado de fora está tudo 2xx, o cliente recebe sucesso e o pedido aparece confirmado. Monitoramento de caixa preta não enxerga isso, e é por isso que o Grafana não mostrou nada. A resposta está no que o código sabe e hoje não conta a ninguém.
-
-## Ferramentas do ambiente
-
-### O gerador de carga
-
-```
-docker compose run --rm carga normal
-docker compose run --rm carga cenario-a
-```
-
-Cada cenário roda até você interromper com Ctrl+C. Para deixar rodando em segundo plano, a flag vem antes do nome do serviço, como em `docker compose run --rm -d carga normal`, e para parar o que ficou rodando assim use `docker stop $(docker ps -q --filter name=carga-run)`. O `normal` é o tráfego saudável, com aprovações e recusas legítimas, e a queixa não se manifesta nele: é contra ele que você calibra o alerta. O `cenario-a` reproduz a queixa, e leva menos de um minuto para isso acontecer.
-
-### O receptor de alertas
-
-`http://localhost:9099`, um serviço mínimo que recebe webhook do Alertmanager e registra no stdout tudo que chega. É a sua prova de que o alerta disparou.
-
-## Requisitos
-
-### 1. Correlacionar log com trace
-
-Por quê. Log e trace hoje são duas ilhas: você tem o trace de uma operação e não acha as linhas de log dela, e tem a linha de um erro e não acha o trace onde ele aconteceu. Essa ponte é a espinha da observabilidade.
-
-Tarefa. Acrescente a toda linha de log dos dois processos os campos `trace_id` e `span_id`, com esses nomes exatos, preenchidos a partir do span ativo no momento em que a linha é escrita. Linhas relacionadas a um pedido carregam também `pedido_id`.
-
-Os dois campos existem em toda linha, sempre. Quando não houver span ativo, como na subida do processo, eles vão vazios. Campo que aparece e some conforme o contexto quebra qualquer filtro automático em cima do log.
-
-O identificador tem que ser o mesmo que aparece no Jaeger. Identificador próprio, gerado pela aplicação e desconectado do trace, não atende.
-
-### 2. Tracing manual e travessia da fila
-
-Por quê. A auto instrumentação entrega os limites técnicos, que são rota e consulta, e não entrega os limites de negócio. E ela não atravessa fila, então hoje não existe forma de olhar um pedido confirmado e ver o que aconteceu na cobrança dele.
-
-Tarefa. Duas coisas.
-
-- Crie dois spans manuais, com estes nomes exatos: `pedido.criar` no `POST /pedidos` e `pedido.processar` no consumo da mensagem pelo worker. Ambos com atributos úteis para diagnóstico, incluindo o identificador do pedido
-- Faça o contexto de trace atravessar a fila, injetando na publicação e extraindo no consumo, de modo que um `POST /pedidos` e o processamento dele formem um único trace com um único `trace_id`
-
-Além disso, toda exceção capturada pelo código passa a ser registrada no span, com o status do span indo para erro, e a produzir uma linha de log de nível `error` com o motivo. O fluxo da aplicação continua exatamente o mesmo: você só passa a contar o que acontece.
-
-Um detalhe do Express que atrapalha exatamente aqui: a versão 4 não captura exceção de handler `async`, então hoje um erro dentro do `POST /pedidos` não chega ao middleware de erro e derruba o processo da `api`. Se você envolver o handler em `try/catch` para registrar a exceção no span, **relance o erro** no fim do `catch`. Capturar a exceção e responder 500 onde antes o processo caía é mudar comportamento, e o que se pede aqui é instrumentar sem mudar.
-
-### 3. Métricas
-
-Por quê. O histograma que já existe comete o erro de cardinalidade mais clássico que existe, e o custo dele não aparece em teste: aparece em produção, semanas depois, quando o Prometheus começa a consumir memória sem explicação. E métrica de infraestrutura sozinha não conta a história do negócio: o sistema pode estar com 100% de disponibilidade e sangrando dinheiro.
-
-Tarefa. Três coisas.
-
-- Encontre o erro de cardinalidade na instrumentação de métricas existente, corrija, e explique no README em uma frase por que aquilo derrubaria um Prometheus em produção
-- Crie três métricas de negócio, com estes nomes e tipos exatos: `pedidos_criados_total` e `pedidos_confirmados_total`, contadores, e `cobrancas_processadas_total`, contador com o label `resultado`, que assume os valores `aprovada`, `recusada` e `falha`
-- Inicialize os três contadores em zero na subida, incluindo cada valor do label `resultado`. Série que só nasce no primeiro evento some do gráfico enquanto está tudo bem e quebra o alerta que dependia dela
-
-A proibição de cardinalidade vale para métrica. Em span e em log o identificador é bem-vindo e necessário, porque lá ele custa barato e é o que permite achar o caso individual.
-
-### 4. Dashboard
-
-Por quê. Dashboard construído na mão dentro do Grafana morre com o container: não é versionado, não é revisado, ninguém sabe quem mudou o quê. E dashboard eficaz não é o que mostra tudo, é o que cabe numa tela e responde as perguntas que alguém vai fazer às três da manhã.
-
-Tarefa. Complete o dashboard `Pedidos`, que já vem provisionado em `grafana/provisioning/dashboards/pedidos.json` e hoje tem um painel só. No fim ele tem no máximo quatro painéis e responde estas três perguntas:
-
-- o sistema está com erro?
-- o sistema está lento?
-- o dinheiro está entrando?
-
-Quais painéis usar para responder é decisão sua, e o teto de quatro é parte do exercício. Todo painel com título que diz o que ele mostra, e o README diz qual das três perguntas cada painel responde.
-
-O painel que já vem no arquivo é exemplo de formato, não peça obrigatória: mantenha, retitule ou apague, como preferir. O que conta no fim é que todo painel que sobrar responda uma das três perguntas e que o seu README diga qual.
-
-### 5. SLO e alerta
-
-Por quê. Limiar escolhido no olho é chute com aparência de rigor, e é assim que nasce o alerta que ninguém respeita. SLO inverte a ordem: primeiro você declara quanta falha o serviço pode ter sem que ninguém precise ser acordado, e o limiar do alerta vira consequência aritmética disso, não opinião.
-
-Tarefa. Declare o objetivo de serviço e derive o alerta dele.
-
-- Defina o **SLI**: a medida de saúde do processamento de cobrança, em uma frase, acompanhada da expressão PromQL que a calcula a partir das suas métricas
-- Defina o **SLO**: o alvo numérico para esse SLI, com a janela de tempo a que ele se refere, e o error budget que esse alvo implica
-- Escreva no Prometheus uma regra chamada exatamente `FalhaEmCobrancas`, cujo limiar **saia do SLO**, com a conta explicada no README. Regra com número redondo escolhido no olho não atende, ainda que dispare na hora certa
-- `for` entre 30s e 1m, inclusive nos extremos. É um limite do desafio, para o disparo ser observável durante a correção
-- O Alertmanager agrupa alertas e espera um intervalo antes de disparar o webhook. O starter já vem com esse intervalo curto, então some ao seu `for` mais alguns segundos e saiba que isso existe antes de achar que a sua regra está quebrada
-- A janela do seu `rate()` também entra no tempo de detecção, e esse é o detalhe que mais confunde. O alerta compara uma proporção, então, se o `cenario-a` sobe logo depois do `normal`, a janela ainda está cheia de sucesso e a proporção precisa primeiro diluir o que estava limpo para só então cruzar o limiar. Quanto mais tráfego saudável cabe na sua janela, e quanto mais alto o seu limiar, mais isso demora. Reiniciar `api` e `worker` não adianta: o Prometheus compensa o reset do contador e o histórico continua contando dentro da janela. Isso não é defeito da sua regra, e o critério de aceite já dá margem para isso. Só não meça o tempo de disparo no primeiro minuto e conclua que nada funciona
-- Comportamento exigido: a regra não dispara no cenário `normal` e dispara no `cenario-a`
-
-Não existe SLO certo neste desafio. Existe SLO justificado: o que vale é a coerência entre o número que você escolheu, o que ele significa para o negócio e o limiar que sai dele.
-
-### 6. Post-mortem
-
-Por quê. Instrumentação existe para responder pergunta, e num time de verdade a resposta vira um documento que outras pessoas leem: o que aconteceu, quanto custou, como foi descoberto e o que muda para não repetir. Sem isso, o incidente é resolvido e esquecido, e volta em três meses com outra roupa.
-
-Tarefa. Investigue a queixa usando a sua instrumentação e escreva `reports/post-mortem.md`, numa versão enxuta do template do módulo de DevOps e SRE, com exatamente estas oito seções, com estes títulos:
-
-- `## Resumo`: o que aconteceu, em duas ou três frases, para quem só vai ler isto
-- `## Impacto`: no período que você reproduziu, quantos pedidos foram afetados e qual o valor envolvido, dizendo de onde saiu cada número. Repare que a sua métrica responde uma dessas perguntas e não responde a outra
-- `## Detecção`: como o problema foi descoberto hoje, quanto tempo o seu alerta leva para detectar o mesmo problema, medido na sua reprodução, e o que essa diferença significa
-- `## Causa raiz`: o arquivo e a função onde o defeito mora, com o trecho de código colado
-- `## Evidências`: um `trace_id` real observado no Jaeger, a query PromQL usada e o comando de busca no log usado, cada um com o resultado que você obteve
-- `## Lições aprendidas`: as três perguntas do template, que são o que correu bem, o que correu mal e onde tivemos sorte
-- `## Itens de ação`: tabela com no mínimo três ações, cada uma com o tipo, sendo evitar ou mitigar, e a prioridade. A correção definitiva do defeito é uma delas, descrita e não executada
-- `## Timeline`: a sequência do que aconteceu e do que você fez, reconstruída a partir da evidência
-
-Um aviso sobre a contagem de pedidos afetados: o `increase()` do Prometheus extrapola a janela e devolve estimativa, não contagem exata, então é normal que ele divirja em alguns pedidos do que você contar no log ou no banco. Isso não é erro seu. Diga de onde veio cada número e, se as fontes divergirem, diga isso também: post-mortem que declara a origem e a precisão de cada número vale mais do que um que apresenta estimativa como se fosse contagem.
-
-Escreva sem procurar culpado. Post-mortem que aponta pessoa não gera aprendizado, gera silêncio no próximo incidente.
-
-### 7. README
-
-Por quê. A entrega é lida por alguém que nunca viu o seu repositório e que vai executar exatamente o que estiver escrito. Se o roteiro não funcionar do zero, a entrega não existe.
-
-Tarefa. Substitua o `README.md` do projeto base por um com estas quatro seções, com estes títulos:
-
-- `## Como rodar`: do clone à stack no ar
-- `## Equivalências com o curso`: tabela com quatro linhas, uma para métricas, uma para tracing, uma para logs estruturados e uma para propagação de contexto, dizendo o que o curso usou em Java e o que você usou em TypeScript
-- `## Decisões técnicas`: a explicação do erro de cardinalidade, o que cada métrica de negócio responde, e qual das três perguntas cada painel do dashboard responde
-- `## SLO e alerta`: o SLI com a expressão que o calcula, o SLO com a janela, o error budget que ele implica, e a conta que leva do SLO ao limiar da regra
-
-## Restrições (não negociáveis)
-
-- Você completa a instrumentação. Não altera comportamento funcional e não muda o contrato das rotas existentes
-- Escrever dentro de um bloco que hoje não registra nada é instrumentação, não correção, e é esperado que você faça isso
-- Não altere a pasta `carga/` nem a pasta `receptor-alertas/`
-- Nenhum componente da stack pode ser substituído por serviço de terceiros, porque a entrega roda inteira na máquina do avaliador
-- Dashboard entra por arquivo versionado. Você pode montar o painel pela interface do Grafana para experimentar, mas o que conta é o JSON versionado, e o ambiente subindo do zero tem que trazer tudo pronto sem nenhum clique
-- Nenhuma credencial nova em arquivo versionado. O que precisar de valor vem do `.env`
-
-## Fora de escopo
-
-- Corrigir o defeito da aplicação
-- Agregação centralizada de log. O log fica em JSON no stdout e a correlação se prova por linha de comando
-- OpenTelemetry Collector e Pushgateway. A exportação é direta e a coleta é por pull
-- Exporters de infraestrutura. O foco é a instrumentação da aplicação
-- Instrumentar o `receptor-alertas` ou o gerador de carga
-- Integração com Slack, e-mail ou qualquer canal externo. O `receptor-alertas` é o destino
-- Pipeline de CI, publicação de imagem e infraestrutura como código. Nada de GitHub Actions aqui
-
-## Critérios de Aceite
-
-Todos os critérios são eliminatórios: qualquer item não atendido reprova a entrega. Cada um traz o comando ou a tela que dá o check, a partir de um clone limpo do seu fork, com a stack no ar e com o cenário de carga que o próprio critério indicar.
-
-Logs
-
-☐ Toda linha de log dos dois processos é JSON e traz `timestamp`, `level`, `service`, `msg`, `trace_id` e `span_id`, mesmo quando os dois últimos estão vazios. Confira com `docker compose logs api | tail -20` e `docker compose logs worker | tail -20`
-☐ Linhas relacionadas a um pedido trazem `pedido_id`
-☐ Rodando `cenario-a`, aparecem linhas de nível `error` com o motivo da falha
-
-Tracing
-
-☐ Um `POST /pedidos` aparece no Jaeger como um trace único que contém spans da `api` e do `worker`
-☐ Esse mesmo trace contém os spans `pedido.criar` e `pedido.processar`
-☐ Rodando `cenario-a`, existe no Jaeger ao menos um trace com span marcado como erro
-☐ O `trace_id` de um trace do Jaeger, buscado com `docker compose logs api worker`, devolve linhas dos dois processos
-
-Métricas
-
-☐ Nenhuma série de `http_request_duration_seconds` usa caminho concreto no lugar do template. `/produtos/:id` está correto, `/produtos/42` reprova
-☐ Nenhuma série usa identificador de pedido ou de cliente como label
-☐ As saídas de `/metrics` dos dois processos, somadas, contêm `pedidos_criados_total`, `pedidos_confirmados_total` e `cobrancas_processadas_total`, esta última com o label `resultado` nos valores `aprovada`, `recusada` e `falha`
-☐ Os três contadores existem já na subida, antes de qualquer tráfego
-
-Dashboard
-
-☐ Existe exatamente um dashboard provisionado por arquivo JSON versionado, e ele abre no Grafana logo após a subida, sem nenhum clique de configuração
-☐ Tem no máximo quatro painéis, nenhum com título vazio ou igual a `Panel Title`
-☐ O README diz, para cada painel, qual das três perguntas do requisito 4 ele responde
-
-SLO e alerta
-
-☐ O README declara o SLI com a expressão PromQL que o calcula, o SLO com alvo e janela, o error budget que ele implica, e a conta que leva do SLO ao limiar da regra
-☐ `http://localhost:9090/rules` exibe `FalhaEmCobrancas`, carregada sem erro e com `for` entre 30s e 1m
-☐ Com o cenário `normal` rodando por 3 minutos após `docker compose restart receptor-alertas`, nenhum alerta aparece em `docker compose logs receptor-alertas`
-☐ Rodando `cenario-a`, `FalhaEmCobrancas` aparece no log do `receptor-alertas` em até 5 minutos. A margem é bem maior que o `for` de propósito: quando o `cenario-a` sobe logo depois do `normal`, a proporção ainda precisa diluir o tráfego saudável que está na janela do `rate()` antes de cruzar o limiar, e quanto mais alto o seu limiar, mais isso demora
-
-Post-mortem
-
-☐ Existe `reports/post-mortem.md` com as oito seções exigidas, com os títulos exatos
-☐ `## Impacto` quantifica pedidos afetados e valor envolvido, dizendo a origem de cada número
-☐ `## Detecção` diz como o problema foi descoberto, quanto tempo o alerta leva para detectá-lo e o que a diferença significa
-☐ `## Causa raiz` cita o arquivo e a função onde o defeito mora, e ambos coincidem com o gabarito de correção
-☐ `## Evidências` traz um `trace_id`, uma query PromQL e um comando de busca no log, cada um com o resultado obtido
-☐ `## Itens de ação` é uma tabela com no mínimo três ações, cada uma com tipo e prioridade
-
-README
-
-☐ O `README.md` tem as quatro seções exigidas, com os títulos exatos, e a tabela de equivalências está preenchida com o que foi usado de fato no código
-
-Integridade
-
-☐ `git diff` contra o repositório base não mostra alteração em `carga/` nem em `receptor-alertas/`
-☐ `git diff -w` contra o repositório base em `src/` mostra apenas linhas de instrumentação, sem alteração no fluxo da aplicação. A opção `-w` existe porque envolver um bloco em um span reindenta o código sem mudar nada
-
-## Estrutura obrigatória do entregável
-
-```
-.
-├── README.md                     (substituído por você)
-├── compose.yaml
-├── .env.example
-├── src/
-│   ├── api/                      você completa a instrumentação
-│   ├── worker/                   você completa a instrumentação
-│   ├── telemetria/               bootstrap do OTel, logger e métricas
-│   └── ...
-├── carga/                        (não alterar)
-├── receptor-alertas/             (não alterar)
-├── prometheus/
-│   ├── prometheus.yml            já configurado, inclusive de onde ler as regras
-│   └── regras/                   (você preenche)
-├── alertmanager/
-│   └── alertmanager.yml          já configurado
-├── grafana/
-│   └── provisioning/
-│       ├── datasources/          já configurado
-│       └── dashboards/
-│           └── pedidos.json      um painel pronto, você completa
-└── reports/
-    └── post-mortem.md            esqueleto pronto, você preenche
-```
-
-## Entrega
-
-- Link do fork público no GitHub, com tudo consolidado na branch `main`
-- README com as quatro seções obrigatórias, verificado do zero
-- O post-mortem em `reports/`
-- A base é obrigatória. Entregas que reescrevem a aplicação, trocam a stack ou corrigem o defeito não serão aceitas
-
-## Ordem de execução sugerida
-
-**1.** Suba o ambiente e explore o que já existe antes de escrever qualquer linha. Faça um pedido, abra o trace no Jaeger, leia uma linha de log, olhe a saída de `/metrics` e os alvos no Prometheus. Metade do desafio é entender onde a instrumentação atual para.
-
-**2.** Comece pela correlação de log com trace. É a peça mais barata e a que mais muda o seu dia dali em diante: sem ela, você vai depurar o resto no escuro. Só considere pronto quando conseguir pegar um `trace_id` no Jaeger e achar as linhas dos dois processos por aquele identificador.
-
-**3.** Ataque as métricas: conserte a cardinalidade primeiro, porque ela suja tudo que vem depois, e só então crie as de negócio. Feito isso, suba os dois cenários e passe alguns minutos só olhando os números subirem. Métrica de negócio serve para levantar pergunta, e é bem provável que você saia daqui com uma.
-
-**4.** Faça os spans manuais e depois a travessia da fila. Este é o ponto mais difícil do desafio. O contexto de trace não é mágica do framework, é dado que precisa viajar junto com a mensagem, e o OpenTelemetry tem uma API própria de propagação para isso. Se ao consumir a mensagem você começar um trace novo em vez de continuar o que existia, o sintoma é claro: dois traces curtos no Jaeger em vez de um completo. E preste atenção em qual contexto você usa como base ao extrair, porque usar o contexto ativo do worker em vez de um contexto raiz é o erro que faz o span nascer no lugar errado.
-
-**5.** Monte o dashboard por arquivo. Derrube tudo com `docker compose down -v`, suba de novo e confirme que os painéis voltaram sozinhos.
-
-**6.** Declare o SLI e o SLO antes de escrever a regra. A ordem importa: quem escreve a regra primeiro acaba inventando um SLO que justifica o número que já tinha escolhido. Depois prove os dois comportamentos, silêncio no `normal` e disparo no `cenario-a`.
-
-**7.** Investigue e escreva o post-mortem. Abra o esqueleto do documento antes de começar a investigar, porque as perguntas dele dizem que evidência você precisa guardar pelo caminho. Reconstruir evidência depois é mais caro do que salvar na hora, e resista ao impulso de procurar a resposta lendo o código: se ela vier do código e não da telemetria, você não provou nada, só confirmou um palpite, que é o que a empresa já fazia antes de você chegar.
-
-**8.** Percorra os critérios de aceite item a item, do zero, seguindo só o seu README, antes do push final.
+Na reprodução de **23/11/2026**, `normal` foi observado por **180,329s sem notificações**. Em seguida, o primeiro webhook chegou **86,915s** após iniciar `cenario-a`: 19:18:05,639 até 19:19:32,554, em UTC-03:00. Esse tempo foi medido no receptor, não inferido apenas do `for`; novas execuções variam com coleta, avaliação, histórico e agrupamento.
