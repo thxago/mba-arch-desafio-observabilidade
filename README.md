@@ -34,6 +34,59 @@ O dashboard **Pedidos**, em `http://localhost:3000/d/pedidos/pedidos`, é provis
 
 As consultas usam `$__rate_interval`, respeitando a frequência de coleta do Prometheus e o zoom do painel, e aplicam `rate()` antes da agregação para tratar resets de cada processo. Unidades são eventos por segundo ou segundos, nunca moeda: o dashboard não quantifica receita nem prejuízo. Atrasos da fila podem causar diferenças transitórias entre confirmação e aprovação; uma divergência sustentada é sinal para investigar pelos traces e logs. Sem requisições na janela, o p95 fica sem valor; a linha HTTP 5xx só assume zero na presença das métricas HTTP, sem mascarar a ausência da coleta. Alterações do dashboard devem ser salvas no JSON versionado, não depender de ajustes manuais na interface.
 
+## SLO e alerta
+
+**SLI:** proporção de cobranças processadas com resposta válida (aprovação ou recusa legítima), sem falha técnica, entre todas as cobranças processadas na janela.
+
+```promql
+(
+  sum(increase(cobrancas_processadas_total{resultado=~"aprovada|recusada"}[30d]))
+  /
+  sum(increase(cobrancas_processadas_total[30d]))
+)
+and on()
+(sum(increase(cobrancas_processadas_total[30d])) > 0)
+```
+
+**SLO:** SLI de pelo menos **99,9% em uma janela móvel de 30 dias**. É um objetivo proposto para este serviço: a cobrança é financeiramente crítica, então toleramos no máximo uma falha técnica a cada mil cobranças, sem penalizar recusas legítimas. Esse SLI mede processamento técnico, não conciliação financeira nem valor recebido.
+
+**Error budget:** `1 - 0,999 = 0,001 = 0,1%` das cobranças da janela. Para `N` cobranças processadas, o orçamento é `0,001 × N` falhas técnicas; por exemplo, 10 falhas em 10.000 cobranças. Como o SLO é baseado em eventos, esse orçamento não equivale automaticamente a minutos de indisponibilidade. O Compose configura retenção de 30 dias no Prometheus para comportar a janela do objetivo. `increase()` estima incrementos a partir das amostras; antes de haver 30 dias de histórico, o cálculo usa somente o período disponível.
+
+**Derivação do alerta:** a regra `FalhaEmCobrancas`, em `prometheus/regras/falha-em-cobrancas.yml`, compara a fração de falhas técnicas em uma janela curta de **1 minuto** com o mesmo budget, sem multiplicador de burn rate (`B = 1`):
+
+```text
+limiar = B × (1 - SLO) = 1 × (1 - 0,999) = 0,001 = 0,1%
+```
+
+```promql
+(
+  sum(rate(cobrancas_processadas_total{resultado="falha"}[1m]))
+  /
+  sum(rate(cobrancas_processadas_total[1m]))
+) > (1 - 0.999)
+and on()
+(sum(rate(cobrancas_processadas_total[1m])) > 0)
+```
+
+A condição deve permanecer verdadeira por `for: 1m`. O limite é estrito: taxa igual ao budget não dispara. A janela curta prioriza detectar rapidamente o defeito financeiro do exercício; não é uma afirmação de que o SLO mensal já foi violado, nem substitui uma política de múltiplas janelas para produção. Essa escolha é sensível a falhas isoladas em baixo volume e deve ser revista antes de uso operacional.
+
+Recusas entram no denominador, não no numerador de falhas. Sem cobranças na janela, as expressões ficam sem resultado avaliável e não disparam; ausência de coleta também não é convertida em sucesso e exigiria monitoramento próprio. Primeiro se calcula `rate()` por série e depois se soma, preservando o tratamento de resets por processo.
+
+O Prometheus coleta e avalia a cada 15s. A detecção inclui a diluição do tráfego anterior na janela de `rate()`, coleta, avaliação, `for: 1m` e o `group_wait: 10s` do Alertmanager. Reiniciar API e worker não apaga o histórico do Prometheus. O destino permanece exclusivamente o webhook local `receptor-alertas`, com severidade `critical`.
+
+Para validar e carregar a regra, com a stack ativa:
+
+```powershell
+docker compose up -d --no-deps --wait prometheus
+docker compose exec -T prometheus promtool check rules /etc/prometheus/regras/falha-em-cobrancas.yml
+docker compose run --rm --no-deps --entrypoint promtool --volume "${PWD}\prometheus:/test:ro" prometheus test rules /test/testes/falha-em-cobrancas.test.yml
+Invoke-WebRequest -Method Post http://localhost:9090/-/reload
+```
+
+Confirme `FalhaEmCobrancas` em `http://localhost:9090/rules`. Reinicie `receptor-alertas`, registre o horário e rode `normal` por pelo menos três minutos, sem notificações. Pare esse gerador antes de iniciar `cenario-a`; o webhook deve chegar em até cinco minutos. Ao consultar os logs, filtre pelo horário do teste: reiniciar o container não apaga suas linhas antigas.
+
+Na reprodução de 23/11/2026, `normal` foi observado por **180,329 segundos sem notificações**. Em seguida, o primeiro webhook de `FalhaEmCobrancas` chegou **86,915 segundos** após iniciar `cenario-a`: início às 19:18:05,639 e recebimento às 19:19:32,554 (UTC-03:00). Esse é o tempo medido de ponta a ponta, não apenas o `for`; novas execuções variam conforme coleta, avaliação, histórico e agrupamento.
+
 ## Descrição
 
 Você vai receber uma aplicação em TypeScript com dois processos e uma instrumentação pela metade. Alguém do time começou a instrumentar meses atrás e parou justamente antes das partes que dão sentido ao resto.

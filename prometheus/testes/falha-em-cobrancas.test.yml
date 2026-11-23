@@ -1,0 +1,77 @@
+rule_files:
+  - ../regras/falha-em-cobrancas.yml
+
+evaluation_interval: 15s
+
+tests:
+  - name: Aprovacoes e recusas legitimas nao disparam
+    interval: 15s
+    input_series:
+      - series: 'cobrancas_processadas_total{resultado="aprovada"}'
+        values: '0+90x24'
+      - series: 'cobrancas_processadas_total{resultado="recusada"}'
+        values: '0+10x24'
+      - series: 'cobrancas_processadas_total{resultado="falha"}'
+        values: '0+0x24'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FalhaEmCobrancas
+        exp_alerts: []
+
+  - name: Ausencia de trafego nao dispara
+    interval: 15s
+    input_series:
+      - series: 'cobrancas_processadas_total{resultado="aprovada"}'
+        values: '0+0x24'
+      - series: 'cobrancas_processadas_total{resultado="recusada"}'
+        values: '0+0x24'
+      - series: 'cobrancas_processadas_total{resultado="falha"}'
+        values: '0+0x24'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FalhaEmCobrancas
+        exp_alerts: []
+
+  - name: Ausencia de series nao dispara
+    interval: 15s
+    input_series: []
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FalhaEmCobrancas
+        exp_alerts: []
+
+  - name: Taxa igual ao budget nao dispara
+    interval: 15s
+    input_series:
+      - series: 'cobrancas_processadas_total{resultado="aprovada"}'
+        values: '0+899x24'
+      - series: 'cobrancas_processadas_total{resultado="recusada"}'
+        values: '0+100x24'
+      - series: 'cobrancas_processadas_total{resultado="falha"}'
+        values: '0+1x24'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FalhaEmCobrancas
+        exp_alerts: []
+
+  - name: Falha sustentada respeita o for e dispara
+    interval: 15s
+    input_series:
+      - series: 'cobrancas_processadas_total{resultado="aprovada"}'
+        values: '0+590x24'
+      - series: 'cobrancas_processadas_total{resultado="recusada"}'
+        values: '0+10x24'
+      - series: 'cobrancas_processadas_total{resultado="falha"}'
+        values: '0+400x24'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: FalhaEmCobrancas
+        exp_alerts: []
+      - eval_time: 1m15s
+        alertname: FalhaEmCobrancas
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Falhas tecnicas de cobranca acima do budget do SLO
+              description: A fracao de falhas tecnicas excede 0,1% por 1m (SLO de 99,9% em 30d). Recusas legitimas nao sao falhas.
