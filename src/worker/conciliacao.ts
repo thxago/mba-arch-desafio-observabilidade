@@ -1,3 +1,4 @@
+import { cobrancasProcessadas } from '../telemetria/metricas';
 import { processarPagamento } from './pagamento';
 import { registrarFalhaLegado } from './registro-legado';
 
@@ -11,8 +12,10 @@ export async function decidirStatusDoPedido(
 
   try {
     const resultado = await processarPagamento(clienteId, valorTotal);
+    cobrancasProcessadas.inc({ resultado: resultado.aprovado ? 'aprovada' : 'recusada' });
     recusado = !resultado.aprovado;
   } catch (erro) {
+    cobrancasProcessadas.inc({ resultado: 'falha' });
     registrarFalhaLegado(erro);
   }
 

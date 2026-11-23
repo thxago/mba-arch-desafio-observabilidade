@@ -10,7 +10,7 @@ import {
 } from '../db/consultas';
 import { publicarPedido } from '../fila/fila';
 import { log } from '../telemetria/log';
-import { TIPO_DE_CONTEUDO, coletar } from '../telemetria/metricas';
+import { TIPO_DE_CONTEUDO, coletar, pedidosCriados } from '../telemetria/metricas';
 
 export function criarRotas(redis: Redis): Router {
   const rotas = Router();
@@ -66,6 +66,7 @@ export function criarRotas(redis: Redis): Router {
     }
 
     const pedido = await criarPedido(clienteId, itens, precoPorProduto);
+    pedidosCriados.inc();
 
     await publicarPedido(redis, {
       pedido_id: pedido.id,

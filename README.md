@@ -9,6 +9,16 @@ Uma instrumentação inacabada, uma queixa do financeiro, e um documento no fim 
 
 O logger compartilhado consulta o span ativo pela API do OpenTelemetry em cada escrita e inclui `trace_id` e `span_id` em todas as linhas JSON. Sem span ativo, ambos são strings vazias. Logs de pedidos incluem `pedido_id` como campo estruturado, preservando a mensagem original. A propagação pela fila ainda não foi implementada: nesta etapa, o worker pode registrar identificadores vazios e não compartilha o trace da API.
 
+O histograma usava caminhos concretos como `/pedidos/25`, criando novas séries para cada identificador e multiplicando o consumo de memória do Prometheus em produção; agora usa templates como `/pedidos/:id` e o valor fixo `nao_encontrada` para rotas desconhecidas.
+
+| Métrica | O que responde |
+| --- | --- |
+| `pedidos_criados_total` | Quantos pedidos foram persistidos com sucesso, antes da publicação na fila? |
+| `pedidos_confirmados_total` | Quantos pedidos o worker efetivamente atualizou para confirmado, independentemente do resultado da cobrança? |
+| `cobrancas_processadas_total` | Quantas cobranças foram aprovadas, legitimamente recusadas ou terminaram em exceção? O label `resultado` distingue `aprovada`, `recusada` e `falha`. |
+
+Os três contadores são inicializados em zero nos dois processos, incluindo os três resultados de cobrança. Somente a API incrementa pedidos criados; somente o worker incrementa confirmações e resultados de cobrança. Para consultar o total da aplicação, some as séries dos processos. Nenhuma métrica usa IDs de pedido ou cliente como labels; esses identificadores continuam nos logs e traces. Contagens não representam valores monetários, e uma confirmação não é tratada como prova de cobrança aprovada.
+
 ## Descrição
 
 Você vai receber uma aplicação em TypeScript com dois processos e uma instrumentação pela metade. Alguém do time começou a instrumentar meses atrás e parou justamente antes das partes que dão sentido ao resto.
