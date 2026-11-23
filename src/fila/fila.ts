@@ -1,3 +1,4 @@
+import { context, propagation } from '@opentelemetry/api';
 import Redis from 'ioredis';
 
 export const NOME_DA_FILA = 'pedidos';
@@ -18,7 +19,9 @@ export async function publicarPedido(
   redis: Redis,
   mensagem: MensagemPedido
 ): Promise<void> {
-  await redis.lpush(NOME_DA_FILA, JSON.stringify(mensagem));
+  const contextoDeTrace: Record<string, string> = {};
+  propagation.inject(context.active(), contextoDeTrace);
+  await redis.lpush(NOME_DA_FILA, JSON.stringify({ ...mensagem, ...contextoDeTrace }));
 }
 
 export async function consumirPedido(

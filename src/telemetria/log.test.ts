@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { after, mock, test } from 'node:test';
-import { trace } from '@opentelemetry/api';
+import { context, trace } from '@opentelemetry/api';
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
-import { log } from './log';
+import { CONTEXTO_DO_PEDIDO, log } from './log';
 
 const sdk = new NodeSDK({
   spanProcessors: [new SimpleSpanProcessor(new InMemorySpanExporter())],
@@ -61,4 +61,14 @@ test('usa o span ativo de cada operacao concorrente e preserva o pedido', async 
   const linha = capturarLinha(() => log.info('operacoes encerradas'));
   assert.equal(linha.trace_id, '');
   assert.equal(linha.span_id, '');
+});
+
+test('inclui o pedido do contexto nas camadas internas sem vazar para fora', () => {
+  context.with(context.active().setValue(CONTEXTO_DO_PEDIDO, 17), () => {
+    const linha = capturarLinha(() => log.error('falha na cobranca'));
+    assert.equal(linha.pedido_id, 17);
+  });
+
+  const linha = capturarLinha(() => log.info('fora do pedido'));
+  assert.equal(linha.pedido_id, undefined);
 });

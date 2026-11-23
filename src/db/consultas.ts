@@ -1,3 +1,4 @@
+import { registrarErro } from '../telemetria/tracing';
 import { pool } from './pool';
 
 export type Produto = {
@@ -107,6 +108,7 @@ export async function criarPedido(
 
     return { id: pedidoId, valor_total: valorTotal };
   } catch (erro) {
+    registrarErro(erro, 'erro ao persistir pedido');
     await cliente.query('ROLLBACK');
     throw erro;
   } finally {

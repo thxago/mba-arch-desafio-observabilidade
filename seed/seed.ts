@@ -1,6 +1,7 @@
 import { migrar } from '../src/db/migracao';
 import { esperarBanco, fecharPool, pool } from '../src/db/pool';
 import { log } from '../src/telemetria/log';
+import { registrarErro } from '../src/telemetria/tracing';
 
 const TOTAL_PRODUTOS = 200;
 const TOTAL_PEDIDOS = 24;
@@ -204,7 +205,7 @@ executar()
     process.exit(0);
   })
   .catch(async (erro) => {
-    log.error('seed nao pode ser aplicado: ' + erro.message);
+    registrarErro(erro, 'seed nao pode ser aplicado');
     await fecharPool();
     process.exit(1);
   });

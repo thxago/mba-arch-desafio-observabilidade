@@ -1,11 +1,13 @@
-import { trace } from '@opentelemetry/api';
+import { context, createContextKey, trace } from '@opentelemetry/api';
 import { NOME_DO_SERVICO } from './servico';
 
 type Nivel = 'info' | 'warn' | 'error';
-type CamposDoLog = { pedido_id?: number };
+export type CamposDoLog = { pedido_id?: number };
+export const CONTEXTO_DO_PEDIDO = createContextKey('pedido_id');
 
 function escrever(level: Nivel, msg: string, campos?: CamposDoLog): void {
   const contexto = trace.getActiveSpan()?.spanContext();
+  const pedidoId = context.active().getValue(CONTEXTO_DO_PEDIDO);
   const linha = {
     timestamp: new Date().toISOString(),
     level,
@@ -13,6 +15,7 @@ function escrever(level: Nivel, msg: string, campos?: CamposDoLog): void {
     msg,
     trace_id: contexto?.traceId ?? '',
     span_id: contexto?.spanId ?? '',
+    ...(typeof pedidoId === 'number' ? { pedido_id: pedidoId } : {}),
     ...campos,
   };
 

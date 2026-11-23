@@ -7,7 +7,11 @@ Uma instrumentação inacabada, uma queixa do financeiro, e um documento no fim 
 
 ## Decisões técnicas
 
-O logger compartilhado consulta o span ativo pela API do OpenTelemetry em cada escrita e inclui `trace_id` e `span_id` em todas as linhas JSON. Sem span ativo, ambos são strings vazias. Logs de pedidos incluem `pedido_id` como campo estruturado, preservando a mensagem original. A propagação pela fila ainda não foi implementada: nesta etapa, o worker pode registrar identificadores vazios e não compartilha o trace da API.
+O logger compartilhado consulta o span ativo pela API do OpenTelemetry em cada escrita e inclui `trace_id` e `span_id` em todas as linhas JSON. Sem span ativo, ambos são strings vazias. Logs de pedidos incluem `pedido_id` como campo estruturado, preservando a mensagem original; o contexto do processamento também fornece esse campo aos logs das camadas internas do worker.
+
+Os spans manuais `pedido.criar` e `pedido.processar` delimitam o negócio e incluem atributos de pedido, cliente e valor; o processamento também registra o status final e a fila. A publicação injeta o W3C Trace Context no JSON da mensagem pela API de propagação do OpenTelemetry. O worker extrai esse contexto a partir de `ROOT_CONTEXT` e o ativa antes de criar seu span consumidor, mantendo API e worker no mesmo trace sem herdar o contexto de outra mensagem. Mensagens antigas sem contexto continuam sendo processadas, iniciando um trace independente.
+
+Exceções capturadas são registradas no span ativo, com status de erro, e em log `error` com o motivo. Os spans terminam em `finally`, inclusive em retornos antecipados. O fluxo funcional permanece intacto: falhas de cobrança não foram corrigidas, e o handler async do Express 4 relança as exceções em vez de convertê-las em respostas 500.
 
 O histograma usava caminhos concretos como `/pedidos/25`, criando novas séries para cada identificador e multiplicando o consumo de memória do Prometheus em produção; agora usa templates como `/pedidos/:id` e o valor fixo `nao_encontrada` para rotas desconhecidas.
 

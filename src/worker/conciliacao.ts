@@ -1,4 +1,5 @@
 import { cobrancasProcessadas } from '../telemetria/metricas';
+import { registrarErro } from '../telemetria/tracing';
 import { processarPagamento } from './pagamento';
 import { registrarFalhaLegado } from './registro-legado';
 
@@ -16,6 +17,7 @@ export async function decidirStatusDoPedido(
     recusado = !resultado.aprovado;
   } catch (erro) {
     cobrancasProcessadas.inc({ resultado: 'falha' });
+    registrarErro(erro, 'erro ao processar cobranca');
     registrarFalhaLegado(erro);
   }
 

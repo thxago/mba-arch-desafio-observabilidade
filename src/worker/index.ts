@@ -1,10 +1,12 @@
 import http from 'node:http';
+import { context, propagation, ROOT_CONTEXT, SpanKind } from '@opentelemetry/api';
 import { atualizarStatusPedido } from '../db/consultas';
 import { esperarBanco, fecharPool } from '../db/pool';
 import { migrar } from '../db/migracao';
-import { consumirPedido, criarConexaoRedis } from '../fila/fila';
-import { log } from '../telemetria/log';
+import { consumirPedido, criarConexaoRedis, NOME_DA_FILA } from '../fila/fila';
+import { CONTEXTO_DO_PEDIDO, log } from '../telemetria/log';
 import { TIPO_DE_CONTEUDO, coletar, pedidosConfirmados } from '../telemetria/metricas';
+import { registrarErro, tracer } from '../telemetria/tracing';
 import { decidirStatusDoPedido } from './conciliacao';
 
 const porta = Number(process.env.WORKER_PORT ?? process.env.PORT ?? 8081);
@@ -41,15 +43,36 @@ async function processarMensagem(mensagem: Record<string, unknown>): Promise<voi
   const clienteId = String(mensagem.cliente_id);
   const valorTotal = Number(mensagem.valor_total);
 
-  log.info('mensagem do pedido ' + pedidoId + ' recebida da fila', { pedido_id: pedidoId });
+  const contextoPai = propagation.extract(ROOT_CONTEXT, mensagem)
+    .setValue(CONTEXTO_DO_PEDIDO, pedidoId);
+  await context.with(contextoPai, () => tracer.startActiveSpan('pedido.processar', {
+    kind: SpanKind.CONSUMER,
+    attributes: {
+      'pedido.id': pedidoId,
+      'cliente.id': clienteId,
+      'pedido.valor_total': valorTotal,
+      'messaging.system': 'redis',
+      'messaging.destination.name': NOME_DA_FILA,
+    },
+  }, async (span) => {
+    try {
+      log.info('mensagem do pedido ' + pedidoId + ' recebida da fila', { pedido_id: pedidoId });
 
-  const status = await decidirStatusDoPedido(clienteId, valorTotal);
-  await atualizarStatusPedido(pedidoId, status);
-  if (status === 'confirmado') {
-    pedidosConfirmados.inc();
-  }
+      const status = await decidirStatusDoPedido(clienteId, valorTotal);
+      await atualizarStatusPedido(pedidoId, status);
+      if (status === 'confirmado') {
+        pedidosConfirmados.inc();
+      }
+      span.setAttribute('pedido.status', status);
 
-  log.info('pedido ' + pedidoId + ' ficou ' + status, { pedido_id: pedidoId });
+      log.info('pedido ' + pedidoId + ' ficou ' + status, { pedido_id: pedidoId });
+    } catch (erro) {
+      registrarErro(erro, 'erro ao processar pedido');
+      throw erro;
+    } finally {
+      span.end();
+    }
+  }));
 }
 
 async function iniciar(): Promise<void> {
@@ -81,13 +104,13 @@ async function iniciar(): Promise<void> {
         await processarMensagem(mensagem);
       }
     } catch (erro) {
-      log.error('erro ao ler a fila: ' + (erro as Error).message);
+      registrarErro(erro, 'erro ao ler a fila');
       await new Promise((resolver) => setTimeout(resolver, 1000));
     }
   }
 }
 
 iniciar().catch((erro) => {
-  log.error('worker nao conseguiu iniciar: ' + erro.message);
+  registrarErro(erro, 'worker nao conseguiu iniciar');
   process.exit(1);
 });
