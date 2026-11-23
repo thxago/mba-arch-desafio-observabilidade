@@ -23,6 +23,17 @@ O histograma usava caminhos concretos como `/pedidos/25`, criando novas séries 
 
 Os três contadores são inicializados em zero nos dois processos, incluindo os três resultados de cobrança. Somente a API incrementa pedidos criados; somente o worker incrementa confirmações e resultados de cobrança. Para consultar o total da aplicação, some as séries dos processos. Nenhuma métrica usa IDs de pedido ou cliente como labels; esses identificadores continuam nos logs e traces. Contagens não representam valores monetários, e uma confirmação não é tratada como prova de cobrança aprovada.
 
+O dashboard **Pedidos**, em `http://localhost:3000/d/pedidos/pedidos`, é provisionado por `grafana/provisioning/dashboards/pedidos.json`, com quatro painéis em duas linhas:
+
+| Painel | Pergunta respondida | Como interpretar |
+| --- | --- | --- |
+| Falhas tecnicas: cobrancas e HTTP 5xx | O sistema está com erro? | Compara falhas técnicas de cobrança e respostas HTTP 5xx por segundo; recusas legítimas não são falhas. |
+| Latencia HTTP p95 por rota | O sistema está lento? | Mostra em segundos o p95 por template de rota, agregando os buckets por `le` e `route` antes de calcular o quantil, sem `/health` e `/metrics`. |
+| Pedidos criados, confirmados e cobrancas aprovadas | O dinheiro está entrando? | Compara as taxas de criação, confirmação e cobrança aprovada; confirmações sustentadamente acima de aprovações revelam divergência, mesmo com HTTP 2xx. |
+| Cobrancas por resultado | O dinheiro está entrando? | Separa aprovações, recusas legítimas e falhas técnicas para explicar o destino das cobranças. |
+
+As consultas usam `$__rate_interval`, respeitando a frequência de coleta do Prometheus e o zoom do painel, e aplicam `rate()` antes da agregação para tratar resets de cada processo. Unidades são eventos por segundo ou segundos, nunca moeda: o dashboard não quantifica receita nem prejuízo. Atrasos da fila podem causar diferenças transitórias entre confirmação e aprovação; uma divergência sustentada é sinal para investigar pelos traces e logs. Sem requisições na janela, o p95 fica sem valor; a linha HTTP 5xx só assume zero na presença das métricas HTTP, sem mascarar a ausência da coleta. Alterações do dashboard devem ser salvas no JSON versionado, não depender de ajustes manuais na interface.
+
 ## Descrição
 
 Você vai receber uma aplicação em TypeScript com dois processos e uma instrumentação pela metade. Alguém do time começou a instrumentar meses atrás e parou justamente antes das partes que dão sentido ao resto.

@@ -1,11 +1,11 @@
 {
   "uid": "pedidos",
   "title": "Pedidos",
-  "description": "Painel inicial do desafio. Acrescente os seus paineis copiando o bloco de panels e trocando a query, o titulo e o gridPos.",
+  "description": "Saude tecnica e fluxo de pedidos e cobrancas. Contagens e taxas nao representam valores monetarios.",
   "tags": ["desafio", "observabilidade"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "10s",
   "editable": true,
   "time": { "from": "now-30m", "to": "now" },
@@ -13,22 +13,154 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Quanto trafego a API esta recebendo? Requisicoes por segundo, por rota",
-      "description": "Taxa de requisicoes HTTP derivada do contador do histograma http_request_duration_seconds.",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "title": "Falhas tecnicas: cobrancas e HTTP 5xx",
+      "description": "Falhas por segundo. Recusas legitimas nao sao falhas tecnicas; respostas HTTP 2xx nao excluem erro na cobranca. A serie HTTP fica em zero sem 5xx apenas quando ha metricas HTTP disponiveis.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (route) (rate(http_request_duration_seconds_count[1m]))",
+          "expr": "sum(rate(cobrancas_processadas_total{resultado=\"falha\"}[$__rate_interval]))",
+          "legendFormat": "Falhas de cobranca",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(http_request_duration_seconds_count{job=\"api\",status=~\"5..\",route!~\"/health|/metrics\"}[$__rate_interval])) or (0 * sum(rate(http_request_duration_seconds_count{job=\"api\",route!~\"/health|/metrics\"}[$__rate_interval])))",
+          "legendFormat": "HTTP 5xx",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Latencia HTTP p95 por rota",
+      "description": "95o percentil estimado pelo histograma, agregando buckets por le e rota antes do quantil. Exclui health e metrics. Sem requisicoes na janela, nao ha percentil.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket{job=\"api\",route!~\"/health|/metrics\"}[$__rate_interval])))",
           "legendFormat": "{{route}}",
           "range": true
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
+          "unit": "s",
+          "min": 0,
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Pedidos criados, confirmados e cobrancas aprovadas",
+      "description": "Eventos por segundo para comparar entrada, confirmacao e cobranca aprovada. Divergencia sustentada entre confirmados e aprovadas exige investigacao; diferencas transitorias podem ser atraso da fila. Nao mede dinheiro nem conta pedidos afetados com exatidao.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(pedidos_criados_total[$__rate_interval]))",
+          "legendFormat": "Pedidos criados",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(pedidos_confirmados_total[$__rate_interval]))",
+          "legendFormat": "Pedidos confirmados",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(cobrancas_processadas_total{resultado=\"aprovada\"}[$__rate_interval]))",
+          "legendFormat": "Cobrancas aprovadas",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Cobrancas por resultado",
+      "description": "Cobrancas por segundo, distinguindo aprovacao, recusa legitima e falha tecnica. Mostra o fluxo de cobrancas, nao receita em reais.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (resultado) (rate(cobrancas_processadas_total[$__rate_interval]))",
+          "legendFormat": "{{resultado}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
           "min": 0,
           "decimals": 2,
           "custom": {
