@@ -5,6 +5,10 @@ Fase do projeto: Do sintoma ao post-mortem
 
 Uma instrumentação inacabada, uma queixa do financeiro, e um documento no fim que explica o que aconteceu
 
+## Decisões técnicas
+
+O logger compartilhado consulta o span ativo pela API do OpenTelemetry em cada escrita e inclui `trace_id` e `span_id` em todas as linhas JSON. Sem span ativo, ambos são strings vazias. Logs de pedidos incluem `pedido_id` como campo estruturado, preservando a mensagem original. A propagação pela fila ainda não foi implementada: nesta etapa, o worker pode registrar identificadores vazios e não compartilha o trace da API.
+
 ## Descrição
 
 Você vai receber uma aplicação em TypeScript com dois processos e uma instrumentação pela metade. Alguém do time começou a instrumentar meses atrás e parou justamente antes das partes que dão sentido ao resto.
